@@ -15,13 +15,13 @@ if [ "$EUID" -ne 0 ]; then
   exit 1
 fi
 
-# Locate the chrome-profile-badger executable in the same directory as the script
+# Locate files in the same directory as the script
 SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 SOURCE_EXE="${SCRIPT_DIR}/chrome-profile-badger"
+SOURCE_ICON="${SCRIPT_DIR}/chrome-profile-badger.png"
 
 if [ ! -f "$SOURCE_EXE" ]; then
   echo "Error: Could not find 'chrome-profile-badger' file in the directory: $SCRIPT_DIR"
-  echo "Make sure you have downloaded or extracted both files to the same folder."
   exit 1
 fi
 
@@ -33,15 +33,25 @@ echo "2. Copying executable to /usr/local/bin/chrome-profile-badger..."
 cp "$SOURCE_EXE" /usr/local/bin/chrome-profile-badger
 chmod +x /usr/local/bin/chrome-profile-badger
 
-echo "3. Creating system start menu desktop entry..."
-cat << 'EOF' > /usr/share/applications/chrome-profile-badger.desktop
+if [ -f "$SOURCE_ICON" ]; then
+  echo "3. Copying icon to /usr/share/pixmaps/chrome-profile-badger.png..."
+  cp "$SOURCE_ICON" /usr/share/pixmaps/chrome-profile-badger.png
+  chmod 644 /usr/share/pixmaps/chrome-profile-badger.png
+  ICON_VALUE="chrome-profile-badger"
+else
+  echo "3. Icon file not found. Falling back to google-chrome icon..."
+  ICON_VALUE="google-chrome"
+fi
+
+echo "4. Creating system start menu desktop entry..."
+cat << EOF > /usr/share/applications/chrome-profile-badger.desktop
 [Desktop Entry]
 Version=1.0
 Type=Application
 Name=Chrome-profile-badger
 Comment=Create badged launchers for Google Chrome profiles
 Exec=chrome-profile-badger
-Icon=google-chrome
+Icon=${ICON_VALUE}
 Terminal=false
 Categories=Utility;Settings;
 StartupWMClass=chrome-profile-badger
