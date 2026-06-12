@@ -1,0 +1,21 @@
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Temporary files
+/tmp/
+*~
+*.swp
+*.log
+
+# Local user configurations
+.vscode/
+.idea/
+.project
+.pydevproject
+.settings/
+
+# Generated preview images
+chrome_badge_preview_tmp.png

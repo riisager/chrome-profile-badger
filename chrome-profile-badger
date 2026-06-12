@@ -1,0 +1,774 @@
+#!/usr/bin/env python3
+import sys
+import os
+import time
+import json
+import glob
+import re
+from PIL import Image, ImageDraw, ImageFont
+import subprocess
+
+# X11 Window Management imports
+try:
+    from Xlib import X, display
+except ImportError:
+    print("Warning: python3-xlib is not installed. Launcher mode will not work.")
+
+# GTK imports
+import gi
+gi.require_version('Gtk', '3.0')
+from gi.repository import Gtk, Gdk, GdkPixbuf, GLib
+
+# Paths
+HOME = os.path.expanduser("~")
+CHROME_CONFIG_DIR = os.path.join(HOME, ".config", "google-chrome")
+DESKTOP_DIR = os.path.join(HOME, ".local", "share", "applications")
+ICONS_DIR = os.path.join(HOME, ".local", "share", "icons")
+
+# Predefined colors (Modern Tailwind-like palette)
+COLORS = {
+    "Red": "#EF4444",
+    "Orange": "#F97316",
+    "Yellow": "#FACC15",
+    "Green": "#22C55E",
+    "Teal": "#14B8A6",
+    "Blue": "#3B82F6",
+    "Purple": "#A855F7",
+    "Pink": "#EC4899"
+}
+
+def ensure_directories():
+    os.makedirs(DESKTOP_DIR, exist_ok=True)
+    os.makedirs(ICONS_DIR, exist_ok=True)
+
+def generate_badged_icon(badge_color_hex, badge_text, output_path):
+    icon_path = "/opt/google/chrome/product_logo_256.png"
+    if not os.path.exists(icon_path):
+        icon_path = "/usr/share/icons/hicolor/256x256/apps/google-chrome.png"
+        
+    try:
+        img = Image.open(icon_path).convert("RGBA")
+    except Exception:
+        # Fallback empty canvas if Chrome logo is missing
+        img = Image.new("RGBA", (256, 256), (255, 255, 255, 0))
+        
+    w, h = img.size
+    draw = ImageDraw.Draw(img)
+    
+    # Parse color
+    color_hex = badge_color_hex.lstrip('#')
+    r = int(color_hex[0:2], 16)
+    g = int(color_hex[2:4], 16)
+    b = int(color_hex[4:6], 16)
+    badge_rgb = (r, g, b)
+    
+    if badge_text:
+        # Determine initial font size and padding dynamically based on text length
+        text_len = len(badge_text)
+        if text_len <= 2:
+            font_size = 84
+            padding_x = 36
+        elif text_len <= 4:
+            font_size = 70
+            padding_x = 30
+        elif text_len <= 7:
+            font_size = 58
+            padding_x = 24
+        else:
+            font_size = 46
+            padding_x = 18
+
+        # Load font and adjust size dynamically if it exceeds the icon width
+        margin = 4
+        max_allowed_width = w - 2 * margin  # 248
+        font = None
+        
+        for attempt in range(15):
+            try:
+                font_paths = [
+                    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+                    "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+                    "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf"
+                ]
+                for fp in font_paths:
+                    if os.path.exists(fp):
+                        font = ImageFont.truetype(fp, font_size)
+                        break
+            except Exception:
+                font = None
+
+            if font:
+                if hasattr(font, "getbbox"):
+                    bbox = font.getbbox(badge_text)
+                    tw = bbox[2] - bbox[0]
+                    th = bbox[3] - bbox[1]
+                else:
+                    tw, th = font.getsize(badge_text)
+            else:
+                tw, th = len(badge_text) * (font_size // 2), font_size - 10
+
+            capsule_height = 144
+            capsule_width = tw + 2 * padding_x
+            
+            # If the capsule fits within icon width, we stop
+            if max(capsule_height, capsule_width) <= max_allowed_width or font_size <= 16:
+                capsule_width = max(capsule_height, capsule_width)
+                break
+                
+            font_size -= 4
+            padding_x = max(8, padding_x - 2)
+            
+        # Position at the bottom-right of the Chrome icon
+        bx = w - capsule_width - margin
+        by = h - capsule_height - margin
+        
+        # Draw white outer capsule (border)
+        draw.rounded_rectangle([bx, by, bx + capsule_width, by + capsule_height], radius=capsule_height//2, fill=(255, 255, 255, 255))
+        
+        # Draw inner colored capsule
+        border_width = 8
+        ibx = bx + border_width
+        iby = by + border_width
+        iw = capsule_width - 2 * border_width
+        ih = capsule_height - 2 * border_width
+        draw.rounded_rectangle([ibx, iby, ibx + iw, iby + ih], radius=ih//2, fill=badge_rgb + (255,))
+        
+        # Draw centered text
+        if font:
+            tx = ibx + (iw - tw) // 2
+            # Slight vertical offset adjustment based on font size
+            vertical_offset = 8 if font_size >= 70 else 5
+            ty = iby + (ih - th) // 2 - vertical_offset
+            draw.text((tx, ty), badge_text, fill=(255, 255, 255, 255), font=font)
+        else:
+            draw.text((ibx + 10, iby + 10), badge_text, fill=(255, 255, 255, 255))
+            
+    img.save(output_path, "PNG")
+
+# --- LAUNCHER MODE ---
+
+def get_client_windows(disp):
+    try:
+        root = disp.screen().root
+        net_client_list = disp.intern_atom('_NET_CLIENT_LIST')
+        prop = root.get_full_property(net_client_list, X.AnyPropertyType)
+        if prop:
+            return set(prop.value)
+    except Exception:
+        pass
+    return set()
+
+def get_window_class(disp, win_id):
+    try:
+        win = disp.create_resource_object('window', win_id)
+        wm_class_atom = disp.intern_atom('WM_CLASS')
+        prop = win.get_full_property(wm_class_atom, X.AnyPropertyType)
+        if prop and prop.value:
+            val = prop.value
+            if isinstance(val, bytes):
+                val = val.decode('utf-8', errors='ignore')
+            parts = [p for p in val.split('\0') if p]
+            return parts
+    except Exception:
+        pass
+    return []
+
+def apply_icon_and_class_to_window(win_id, class_name, icon_path):
+    try:
+        disp = display.Display()
+        win = disp.create_resource_object('window', win_id)
+        
+        # 1. Update WM_CLASS
+        wm_class_atom = disp.intern_atom('WM_CLASS')
+        string_atom = disp.intern_atom('STRING')
+        wm_class_str = f"{class_name}\0{class_name.capitalize()}\0"
+        win.change_property(wm_class_atom, string_atom, 8, wm_class_str.encode('utf-8'))
+        
+        # 2. Update _NET_WM_ICON (Resize to 128x128 to stay within X11 request length limits)
+        if os.path.exists(icon_path):
+            try:
+                resampling = Image.Resampling.LANCZOS
+            except AttributeError:
+                resampling = Image.LANCZOS
+            img = Image.open(icon_path).resize((128, 128), resampling).convert("RGBA")
+            w, h = img.size
+            data = [w, h]
+            for y in range(h):
+                for x in range(w):
+                    r, g, b, a = img.getpixel((x, y))
+                    argb = (a << 24) | (r << 16) | (g << 8) | b
+                    data.append(argb)
+            
+            net_wm_icon = disp.intern_atom('_NET_WM_ICON')
+            cardinal = disp.intern_atom('CARDINAL')
+            win.change_property(net_wm_icon, cardinal, 32, data, X.PropModeReplace)
+            
+        disp.flush()
+        return True
+    except Exception as e:
+        print(f"Error applying window updates: {e}")
+        return False
+
+def run_launcher(profile_dir, class_name, color_hex, badge_text):
+    ensure_directories()
+    icon_name = f"chrome-profile-{class_name}"
+    icon_path = os.path.join(ICONS_DIR, f"{icon_name}.png")
+    
+    # Double-check that the icon exists, if not generate it
+    if not os.path.exists(icon_path):
+        generate_badged_icon(color_hex, badge_text, icon_path)
+        
+    try:
+        disp = display.Display()
+    except Exception:
+        # Fallback if no X server connection (just run Chrome)
+        subprocess.Popen(["google-chrome", f"--profile-directory={profile_dir}"])
+        return
+
+    # Helper to get the active window
+    def get_active_win(d):
+        try:
+            root = d.screen().root
+            net_active = d.intern_atom('_NET_ACTIVE_WINDOW')
+            prop = root.get_full_property(net_active, X.AnyPropertyType)
+            if prop and prop.value:
+                return prop.value[0]
+        except Exception:
+            pass
+        return None
+
+    # Check state before launching
+    old_windows = get_client_windows(disp)
+    old_active = get_active_win(disp)
+    
+    # Launch Chrome
+    subprocess.Popen(["google-chrome", f"--profile-directory={profile_dir}"])
+    
+    # Poll for the window (either new window or newly focused window)
+    target_win_id = None
+    for _ in range(50):  # Poll up to 5 seconds
+        time.sleep(0.1)
+        # We must recreate the display to refresh the window list property cache in python-xlib
+        loop_disp = display.Display()
+        current_windows = get_client_windows(loop_disp)
+        active_win = get_active_win(loop_disp)
+        
+        # Scenario A: A new window appeared
+        new_candidates = current_windows - old_windows
+        for win_id in new_candidates:
+            classes = get_window_class(loop_disp, win_id)
+            if "google-chrome" in classes or "Google-chrome" in classes:
+                target_win_id = win_id
+                break
+                
+        # Scenario B: No new window, but an existing Chrome window got focused
+        if not target_win_id and active_win and active_win != old_active:
+            classes = get_window_class(loop_disp, active_win)
+            if "google-chrome" in classes or "Google-chrome" in classes:
+                target_win_id = active_win
+                break
+                
+        if target_win_id:
+            break
+            
+    if target_win_id:
+        time.sleep(0.15)  # Tiny pause to let the window draw/focus fully
+        apply_icon_and_class_to_window(target_win_id, class_name, icon_path)
+
+# --- GUI MODE ---
+
+class ChromeProfileBadgerApp(Gtk.Window):
+    def __init__(self):
+        super().__init__(title="Chrome-profile-badger")
+        self.set_default_size(550, 650)
+        self.set_resizable(False)
+        self.set_position(Gtk.WindowPosition.CENTER)
+        
+        ensure_directories()
+        
+        # Active configurations
+        self.selected_color = COLORS["Blue"]
+        self.selected_profile = "Default"
+        
+        # Build UI
+        self.build_ui()
+        self.update_color_button(self.selected_color)
+        
+        # Load profile names
+        self.load_profiles()
+        
+        # Initial Preview
+        self.update_preview()
+        
+        # Load existing shortcuts
+        self.load_existing_shortcuts()
+
+    def build_ui(self):
+        main_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=15)
+        main_vbox.set_property("margin", 20)
+        self.add(main_vbox)
+        
+        # Header Info
+        header_label = Gtk.Label()
+        header_label.set_markup("<span size='large' weight='bold'>Chrome-profile-badger</span>\n"
+                                "<span size='small' foreground='#666'>Create unique shortcuts with badged icons for your Google Chrome profiles so they do not group together on the taskbar.</span>")
+        header_label.set_line_wrap(True)
+        header_label.set_xalign(0.0)
+        main_vbox.pack_start(header_label, False, False, 0)
+        
+        # Top Split (Inputs on Left, Preview on Right)
+        top_hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=20)
+        main_vbox.pack_start(top_hbox, False, False, 0)
+        
+        # Left Side (Form)
+        form_grid = Gtk.Grid(column_spacing=10, row_spacing=12)
+        top_hbox.pack_start(form_grid, True, True, 0)
+        
+        # 1. Profile Select
+        profile_lbl = Gtk.Label(label="Chrome Profile:", xalign=0.0)
+        form_grid.attach(profile_lbl, 0, 0, 1, 1)
+        
+        self.profile_combo = Gtk.ComboBoxText()
+        self.profile_combo.connect("changed", self.on_profile_changed)
+        form_grid.attach(self.profile_combo, 1, 0, 1, 1)
+        
+        # 2. Name entry
+        name_lbl = Gtk.Label(label="Shortcut Name:", xalign=0.0)
+        form_grid.attach(name_lbl, 0, 1, 1, 1)
+        
+        self.name_entry = Gtk.Entry()
+        self.name_entry.set_placeholder_text("e.g. Chrome - Work")
+        self.name_entry.connect("changed", lambda e: self.update_preview())
+        form_grid.attach(self.name_entry, 1, 1, 1, 1)
+        
+        # 3. Badge Text
+        badge_lbl = Gtk.Label(label="Badge Text (up to 10 chars):", xalign=0.0)
+        form_grid.attach(badge_lbl, 0, 2, 1, 1)
+        
+        self.badge_entry = Gtk.Entry()
+        self.badge_entry.set_max_length(10)
+        self.badge_entry.set_text("A")
+        self.badge_entry.connect("changed", lambda e: self.update_preview())
+        form_grid.attach(self.badge_entry, 1, 2, 1, 1)
+        
+        # 4. Color Palette (Presets)
+        color_lbl = Gtk.Label(label="Preset Colors:", xalign=0.0)
+        form_grid.attach(color_lbl, 0, 3, 1, 1)
+        
+        color_hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
+        form_grid.attach(color_hbox, 1, 3, 1, 1)
+        
+        # Render Palette
+        for name, hex_code in COLORS.items():
+            btn = Gtk.Button()
+            btn.set_size_request(24, 24)
+            context = btn.get_style_context()
+            btn.set_tooltip_text(name)
+            
+            provider = Gtk.CssProvider()
+            css = f"button {{ background-color: {hex_code}; background-image: none; border-radius: 12px; border: 1px solid rgba(0,0,0,0.2); }}"
+            provider.load_from_data(css.encode('utf-8'))
+            context.add_provider(provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+            
+            btn.connect("clicked", self.on_preset_color_clicked, hex_code)
+            color_hbox.pack_start(btn, False, False, 0)
+            
+        # 5. Custom Color Selection (New Row)
+        custom_lbl = Gtk.Label(label="Custom Color:", xalign=0.0)
+        form_grid.attach(custom_lbl, 0, 4, 1, 1)
+        
+        custom_hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        form_grid.attach(custom_hbox, 1, 4, 1, 1)
+        
+        self.custom_color_btn = Gtk.ColorButton()
+        self.custom_color_btn.set_rgba(Gdk.RGBA(0.2, 0.5, 0.9, 1.0))
+        self.custom_color_btn.connect("color-set", self.on_custom_color_set)
+        custom_hbox.pack_start(self.custom_color_btn, False, False, 0)
+        
+        self.hex_entry = Gtk.Entry()
+        self.hex_entry.set_width_chars(10)
+        self.hex_entry.set_placeholder_text("#3B82F6")
+        self.hex_entry.set_text(self.selected_color)
+        self.hex_entry.connect("changed", self.on_hex_entry_changed)
+        custom_hbox.pack_start(self.hex_entry, False, False, 0)
+        
+        # Right Side (Preview Image)
+        preview_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
+        top_hbox.pack_start(preview_vbox, False, False, 10)
+        
+        preview_title = Gtk.Label(label="Preview:")
+        preview_title.set_markup("<span size='small' weight='bold'>Icon Preview:</span>")
+        preview_vbox.pack_start(preview_title, False, False, 0)
+        
+        self.preview_img = Gtk.Image()
+        preview_vbox.pack_start(self.preview_img, True, True, 0)
+        
+        # Create Shortcut Button
+        self.create_btn = Gtk.Button(label="Create / Update Shortcut")
+        self.create_btn.get_style_context().add_class("suggested-action")
+        provider = Gtk.CssProvider()
+        css = "button.suggested-action { background-color: #3B82F6; color: white; font-weight: bold; padding: 6px 12px; }"
+        provider.load_from_data(css.encode('utf-8'))
+        self.create_btn.get_style_context().add_provider(provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        self.create_btn.connect("clicked", self.on_create_shortcut_clicked)
+        main_vbox.pack_start(self.create_btn, False, False, 5)
+        
+        # Separator
+        sep = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
+        main_vbox.pack_start(sep, False, False, 5)
+        
+        # Bottom Side (List of existing shortcuts)
+        list_title = Gtk.Label(xalign=0.0)
+        list_title.set_markup("<span size='medium' weight='bold'>My Badged Profile Shortcuts:</span>")
+        main_vbox.pack_start(list_title, False, False, 0)
+        
+        scrolled_win = Gtk.ScrolledWindow()
+        scrolled_win.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scrolled_win.set_shadow_type(Gtk.ShadowType.IN)
+        scrolled_win.set_size_request(-1, 200)
+        main_vbox.pack_start(scrolled_win, True, True, 0)
+        
+        self.listbox = Gtk.ListBox()
+        self.listbox.set_selection_mode(Gtk.SelectionMode.NONE)
+        scrolled_win.add(self.listbox)
+
+    def load_profiles(self):
+        if not os.path.exists(CHROME_CONFIG_DIR):
+            self.show_error("Google Chrome does not appear to be installed (config directory is missing).")
+            return
+            
+        profiles = []
+        local_state_path = os.path.join(CHROME_CONFIG_DIR, "Local State")
+        
+        info_cache = {}
+        if os.path.exists(local_state_path):
+            try:
+                with open(local_state_path, "r") as f:
+                    state_data = json.load(f)
+                    info_cache = state_data.get("profile", {}).get("info_cache", {})
+            except Exception as e:
+                print(f"Error reading Local State: {e}")
+                
+        if info_cache:
+            for p_dir, p_info in info_cache.items():
+                if os.path.exists(os.path.join(CHROME_CONFIG_DIR, p_dir)):
+                    name = p_info.get("name")
+                    email = p_info.get("user_name")
+                    
+                    if name and email:
+                        display_name = f"{name} ({email})"
+                    elif name:
+                        display_name = name
+                    elif email:
+                        display_name = email
+                    else:
+                        display_name = p_dir
+                        
+                    profiles.append((p_dir, display_name))
+        
+        if not profiles:
+            default_pref = os.path.join(CHROME_CONFIG_DIR, "Default", "Preferences")
+            if os.path.exists(default_pref):
+                profiles.append(("Default", "Default (Primary)"))
+                
+            for folder in glob.glob(os.path.join(CHROME_CONFIG_DIR, "Profile *")):
+                profile_dir = os.path.basename(folder)
+                pref_path = os.path.join(folder, "Preferences")
+                profile_name = profile_dir
+                if os.path.exists(pref_path):
+                    try:
+                        with open(pref_path, "r") as f:
+                            data = json.load(f)
+                            name_val = data.get("profile", {}).get("name")
+                            if name_val and name_val != "Your Chrome":
+                                profile_name = f"{profile_dir} ({name_val})"
+                    except Exception:
+                        pass
+                profiles.append((profile_dir, profile_name))
+                
+        profiles.sort(key=lambda x: (0 if x[0] == "Default" else 1, x[1].lower()))
+        
+        for p_dir, p_name in profiles:
+            self.profile_combo.append(p_dir, p_name)
+            
+        if profiles:
+            self.profile_combo.set_active(0)
+
+    def on_profile_changed(self, combo):
+        active_id = combo.get_active_id()
+        if active_id:
+            self.selected_profile = active_id
+            active_text = combo.get_active_text()
+            
+            match = re.match(r'^([^\(]+)', active_text)
+            if match:
+                profile_nick = match.group(1).strip()
+            else:
+                profile_nick = active_text
+                
+            if profile_nick.lower() == "default":
+                profile_nick = "Primary"
+                
+            self.name_entry.set_text(f"Chrome - {profile_nick}")
+            
+            badge_letter = profile_nick[0].upper() if profile_nick else "C"
+            self.badge_entry.set_text(badge_letter)
+
+    def on_preset_color_clicked(self, widget, color_hex):
+        if getattr(self, "is_updating_color", False):
+            return
+        self.is_updating_color = True
+        self.selected_color = color_hex
+        self.hex_entry.set_text(color_hex)
+        self.update_color_button(color_hex)
+        self.update_preview()
+        self.is_updating_color = False
+
+    def on_custom_color_set(self, widget):
+        if getattr(self, "is_updating_color", False):
+            return
+        self.is_updating_color = True
+        rgba = widget.get_rgba()
+        r = int(rgba.red * 255)
+        g = int(rgba.green * 255)
+        b = int(rgba.blue * 255)
+        color_hex = f"#{r:02X}{g:02X}{b:02X}"
+        self.selected_color = color_hex
+        self.hex_entry.set_text(color_hex)
+        self.update_preview()
+        self.is_updating_color = False
+
+    def on_hex_entry_changed(self, entry):
+        if getattr(self, "is_updating_color", False):
+            return
+        color_hex = entry.get_text().strip()
+        if re.match(r"^#[0-9a-fA-F]{6}$", color_hex):
+            self.is_updating_color = True
+            self.selected_color = color_hex
+            self.update_color_button(color_hex)
+            self.update_preview()
+            self.is_updating_color = False
+        elif re.match(r"^#[0-9a-fA-F]{3}$", color_hex):
+            r, g, b = color_hex[1], color_hex[2], color_hex[3]
+            color_hex = f"#{r}{r}{g}{g}{b}{b}"
+            self.is_updating_color = True
+            self.selected_color = color_hex
+            self.update_color_button(color_hex)
+            self.update_preview()
+            self.is_updating_color = False
+
+    def update_color_button(self, color_hex):
+        try:
+            r = int(color_hex[1:3], 16) / 255.0
+            g = int(color_hex[3:5], 16) / 255.0
+            b = int(color_hex[5:7], 16) / 255.0
+            rgba = Gdk.RGBA(r, g, b, 1.0)
+            self.custom_color_btn.set_rgba(rgba)
+        except Exception as e:
+            print(f"Error updating color button: {e}")
+
+    def update_preview(self):
+        text = self.badge_entry.get_text()
+        color = self.selected_color
+        
+        preview_path = "/tmp/chrome_badge_preview_tmp.png"
+        try:
+            generate_badged_icon(color, text, preview_path)
+            pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_scale(preview_path, 96, 96, True)
+            self.preview_img.set_from_pixbuf(pixbuf)
+        except Exception as e:
+            print(f"Error drawing preview: {e}")
+
+    def load_existing_shortcuts(self):
+        for child in self.listbox.get_children():
+            self.listbox.remove(child)
+            
+        entries = glob.glob(os.path.join(DESKTOP_DIR, "chrome-profile-*.desktop"))
+        for entry_path in entries:
+            # Skip the decorator tool itself
+            if "chrome-profile-decorator.desktop" in entry_path or "chrome-profile-badger.desktop" in entry_path:
+                continue
+                
+            try:
+                name = ""
+                profile = ""
+                icon_path = ""
+                with open(entry_path, "r") as f:
+                    for line in f:
+                        if line.startswith("Name="):
+                            name = line.strip().split("Name=")[1]
+                        elif line.startswith("Icon="):
+                            icon_path = line.strip().split("Icon=")[1]
+                        elif line.startswith("Exec="):
+                            exec_line = line.strip()
+                            match_p = re.search(r'--profile\s+"([^"]+)"', exec_line)
+                            if not match_p:
+                                match_p = re.search(r'--profile\s+([^\s]+)', exec_line)
+                            if match_p:
+                                profile = match_p.group(1)
+                                
+                if not name:
+                    name = os.path.basename(entry_path)
+                    
+                self.add_shortcut_row(name, profile, icon_path, entry_path)
+            except Exception as e:
+                print(f"Error reading desktop file {entry_path}: {e}")
+                
+        self.listbox.show_all()
+
+    def add_shortcut_row(self, name, profile, icon_path, desktop_path):
+        row = Gtk.ListBoxRow()
+        row_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        row_box.set_property("margin", 5)
+        row.add(row_box)
+        
+        img = Gtk.Image()
+        if os.path.exists(icon_path):
+            try:
+                pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_scale(icon_path, 32, 32, True)
+                img.set_from_pixbuf(pixbuf)
+            except Exception:
+                img.set_from_icon_name("google-chrome", Gtk.IconSize.LARGE_TOOLBAR)
+        else:
+            img.set_from_icon_name("google-chrome", Gtk.IconSize.LARGE_TOOLBAR)
+            
+        row_box.pack_start(img, False, False, 0)
+        
+        details_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        details_label = Gtk.Label(xalign=0.0)
+        details_label.set_markup(f"<b>{name}</b>")
+        info_label = Gtk.Label(xalign=0.0)
+        info_label.set_markup(f"<span size='small' foreground='#777'>Profile: {profile}</span>")
+        
+        details_vbox.pack_start(details_label, False, False, 0)
+        details_vbox.pack_start(info_label, False, False, 0)
+        row_box.pack_start(details_vbox, True, True, 0)
+        
+        del_btn = Gtk.Button()
+        del_btn.set_image(Gtk.Image.new_from_icon_name("edit-delete", Gtk.IconSize.BUTTON))
+        del_btn.set_relief(Gtk.ReliefStyle.NONE)
+        del_btn.connect("clicked", self.on_delete_shortcut_clicked, desktop_path, icon_path)
+        row_box.pack_start(del_btn, False, False, 0)
+        
+        self.listbox.add(row)
+
+    def on_delete_shortcut_clicked(self, widget, desktop_path, icon_path):
+        dialog = Gtk.MessageDialog(
+            transient_for=self,
+            flags=0,
+            message_type=Gtk.MessageType.QUESTION,
+            buttons=Gtk.ButtonsType.YES_NO,
+            text="Do you want to delete this shortcut?"
+        )
+        dialog.format_secondary_text(f"This will permanently delete the shortcut '{os.path.basename(desktop_path)}' from your launcher menus.")
+        
+        response = dialog.run()
+        if response == Gtk.ResponseType.YES:
+            try:
+                if os.path.exists(desktop_path):
+                    os.remove(desktop_path)
+                if os.path.exists(icon_path):
+                    os.remove(icon_path)
+                self.load_existing_shortcuts()
+            except Exception as e:
+                self.show_error(f"Could not delete shortcut files: {e}")
+                
+        dialog.destroy()
+
+    def on_create_shortcut_clicked(self, widget):
+        display_name = self.name_entry.get_text().strip()
+        badge_text = self.badge_entry.get_text().strip()
+        profile_folder = self.selected_profile
+        color = self.selected_color
+        
+        if not display_name:
+            self.show_error("Please enter a name for the shortcut.")
+            return
+            
+        class_name = "chrome-profile-" + re.sub(r'[^a-zA-Z0-9]', '-', display_name.lower())
+        
+        icon_filename = f"{class_name}.png"
+        icon_path = os.path.join(ICONS_DIR, icon_filename)
+        desktop_filename = f"{class_name}.desktop"
+        desktop_path = os.path.join(DESKTOP_DIR, desktop_filename)
+        
+        try:
+            generate_badged_icon(color, badge_text, icon_path)
+            
+            script_path = os.path.abspath(__file__)
+            desktop_content = f"""[Desktop Entry]
+Version=1.0
+Type=Application
+Name={display_name}
+Comment=Google Chrome profile: {profile_folder}
+Exec=python3 {script_path} --launcher --profile "{profile_folder}" --class-name "{class_name}" --color "{color}" --badge "{badge_text}"
+Icon={icon_path}
+StartupWMClass={class_name}
+Terminal=false
+Categories=Network;WebBrowser;
+MimeType=text/html;text/xml;application/xhtml+xml;x-scheme-handler/http;x-scheme-handler/https;
+"""
+            with open(desktop_path, "w") as f:
+                f.write(desktop_content)
+                
+            os.chmod(desktop_path, 0o755)
+            self.load_existing_shortcuts()
+            
+            dialog = Gtk.MessageDialog(
+                transient_for=self,
+                flags=0,
+                message_type=Gtk.MessageType.INFO,
+                buttons=Gtk.ButtonsType.OK,
+                text="Shortcut created successfully!"
+            )
+            dialog.format_secondary_text(
+                f"The shortcut '{display_name}' has been added to your applications menu.\n\n"
+                "Search for it in your system start menu (under 'Internet') and add/pin it to your panel (taskbar)."
+            )
+            dialog.run()
+            dialog.destroy()
+            
+        except Exception as e:
+            self.show_error(f"Could not create shortcut: {e}")
+
+    def show_error(self, message):
+        dialog = Gtk.MessageDialog(
+            transient_for=self,
+            flags=0,
+            message_type=Gtk.MessageType.ERROR,
+            buttons=Gtk.ButtonsType.CLOSE,
+            text="An error occurred"
+        )
+        dialog.format_secondary_text(message)
+        dialog.run()
+        dialog.destroy()
+
+# --- MAIN INVOCATION ENTRY ---
+
+def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "--launcher":
+        profile_dir = "Default"
+        class_name = "chrome-profile-default"
+        color_hex = "#3B82F6"
+        badge_text = ""
+        
+        for i in range(len(sys.argv)):
+            if sys.argv[i] == "--profile" and i+1 < len(sys.argv):
+                profile_dir = sys.argv[i+1]
+            elif sys.argv[i] in ("--class", "--class-name") and i+1 < len(sys.argv):
+                class_name = sys.argv[i+1]
+            elif sys.argv[i] == "--color" and i+1 < len(sys.argv):
+                color_hex = sys.argv[i+1]
+            elif sys.argv[i] == "--badge" and i+1 < len(sys.argv):
+                badge_text = sys.argv[i+1]
+                
+        run_launcher(profile_dir, class_name, color_hex, badge_text)
+    else:
+        Gtk.init(None)
+        app = ChromeProfileBadgerApp()
+        app.connect("destroy", Gtk.main_quit)
+        app.show_all()
+        Gtk.main()
+
+if __name__ == "__main__":
+    main()
